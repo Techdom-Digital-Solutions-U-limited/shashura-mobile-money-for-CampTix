@@ -4,7 +4,7 @@ Tags: camptix, shashura, mobile money, mtn, airtel, uganda
 Requires at least: 5.8
 Tested up to: 7.1
 Requires PHP: 7.4
-Stable tag: 1.0.3
+Stable tag: 1.0.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -121,6 +121,13 @@ A Shashura merchant account, with an app's Client ID and Client Secret, is requi
 
 == Changelog ==
 
+= 1.0.4 =
+* Hardened the API endpoint: removed the per-site "API Base URL" setting entirely (including silently clearing any previously saved value). The endpoint is now fixed to Shashura's public API unless explicitly overridden by trusted deployment code (a `SHASMOMO_BASE_URL` constant in `wp-config.php`), never by a site's saved settings — closing a path where a compromised or tampered settings save could have redirected API credentials to another server. All requests now go through WordPress's safe HTTP transport, which blocks requests to private/internal network addresses.
+* The buyer now sees a specific reason when a payment is declined (not enough balance, wrong PIN, cancelled, timed out, etc.) instead of a generic "declined or expired" message.
+* A payment collected for the wrong amount is no longer treated as a failed payment. It's held for reconciliation instead: the buyer is told not to pay again, the order is never auto-cancelled, and the site administrator is emailed once with the details needed to resolve it.
+* Refunds are now confirmed, not assumed. CampTix is only told a refund succeeded once Shashura confirms the customer's phone actually received the money — a reversed ledger entry with an unconfirmed or failed payout now holds the order for manual reconciliation instead of silently reporting success. Concurrent or repeated refund clicks on the same order are blocked while one is in progress.
+* A refund payout that resolves after the fact (the common case for MTN, which confirms asynchronously) now automatically clears that reconciliation hold once Shashura confirms delivery, instead of requiring a manual check.
+
 = 1.0.3 =
 * The buyer-facing payment pages now show the actual MTN MoMo and Airtel Money logos instead of a coloured badge with the network name. A site without permission to use the official logos can restore the plain badge, or supply its own image, through the `shasmomo_network_logo` filter.
 * Updated plugin credits: now developed and maintained by Techdom Digital Solutions. Added Cipherwave Software Limited and Moses Ssebuwufu as contributors.
@@ -139,6 +146,9 @@ A Shashura merchant account, with an app's Client ID and Client Secret, is requi
 * Initial release. MTN and Airtel Mobile Money collection for CampTix via the Shashura API, with number verification, webhook and status-enquiry reconciliation, duplicate-payment detection, and support for both CampTix 2.x and 1.4.x.
 
 == Upgrade Notice ==
+
+= 1.0.4 =
+Security hardening: the API endpoint can no longer be redirected via site settings (removes the "API Base URL" field). Also adds buyer-facing decline reasons, safer handling of wrong-amount payments and refunds. Recommended for all sites.
 
 = 1.0.3 =
 Payment pages now show the real MTN/Airtel logos by default (filter-overridable). Plugin credits also updated: Techdom Digital Solutions, Cipherwave Software Limited.

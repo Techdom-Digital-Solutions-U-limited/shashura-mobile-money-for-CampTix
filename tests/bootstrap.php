@@ -25,6 +25,7 @@ function __($s,$domain=null){return $s;}
 function wp_list_pluck($a,$k){return array_column($a,$k);}
 class Rendered extends Exception {}
 function status_header($status){throw new Rendered('Rendered reconciliation warning');}
+class WP_REST_Response { public $data; public $status; function __construct($data=array(),$status=200){$this->data=$data;$this->status=$status;} }
 class MockDB {
  public $options='wp_options'; public $locks=[];
  function prepare($q,...$args){return [$q,$args];}

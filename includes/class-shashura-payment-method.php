@@ -772,7 +772,7 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 	 * @return int CampTix_Plugin::PAYMENT_STATUS_REFUNDED|PAYMENT_STATUS_REFUND_FAILED
 	 */
 	public function payment_refund( $payment_token ) {
-		$data = $this->send_refund_request( $payment_token );
+		$data = $this->send_refund_request( $payment_token, null, 'full' );
 		return $this->report( $payment_token, $data['status'], $data, true );
 	}
 
@@ -785,7 +785,7 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 	 * @return array { status, refund_transaction_id, refund_transaction_details }
 	 */
 	public function payment_refund_partial( $payment_token, $amount, $refunds_remainder ) {
-		return $this->send_refund_request( $payment_token, $refunds_remainder ? null : $amount );
+		return $this->send_refund_request( $payment_token, $refunds_remainder ? null : $amount, 'partial' );
 	}
 
 	/**
@@ -795,7 +795,7 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 	 * @param float|null $amount Amount to refund; null refunds whatever remains.
 	 * @return array { status, transaction_id, refund_transaction_id, refund_transaction_details }
 	 */
-	public function send_refund_request( $payment_token, $amount = null ) {
+	public function send_refund_request( $payment_token, $amount = null, $via = 'full' ) {
 		$failed = array(
 			'status' => CampTix_Plugin::PAYMENT_STATUS_REFUND_FAILED,
 			'transaction_id' => '', 'refund_transaction_id' => '',
@@ -814,8 +814,11 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 			if ( get_post_meta( $first, '_shashura_refund_hold', true ) ) {
 				return $failed;
 			}
-			// Write before sending: a timeout or process crash must not invite another reversal.
-			$hold = array( 'phase' => 'request_started', 'at' => time(), 'amount' => $amount );
+			// Write before sending: a timeout or process crash must not invite another
+			// reversal. 'via' records whether this came from the whole-order refund
+			// button or a per-ticket partial refund — the later webhook confirmation
+			// needs to know which CampTix bookkeeping call to replay.
+			$hold = array( 'phase' => 'request_started', 'at' => time(), 'amount' => $amount, 'via' => $via );
 			if ( ! update_post_meta( $first, '_shashura_refund_hold', $hold ) ) {
 				return $failed;
 			}
@@ -829,7 +832,7 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 				wp_mail(
 					get_option( 'admin_email' ),
 					'CampTix Mobile Money refund needs reconciliation',
-					sprintf( "Customer payout is not confirmed. Refund reference: %s. Inspect the gateway ledger and payout status. Retry ONLY the payout in the Shashura dashboard if the reversal succeeded. Do not repeat the ledger reversal. The plugin has blocked further refund requests for this order pending manual reconciliation. Order: %s", $result['refund_transaction_id'], admin_url( 'post.php?post=' . $first . '&action=edit' ) )
+					sprintf( "Customer payout is not confirmed. Refund reference: %s. Inspect the gateway ledger and payout status. Retry ONLY the payout in the Shashura dashboard if the reversal succeeded. Do not repeat the ledger reversal. The plugin has blocked further refund requests for this order pending manual reconciliation, and will clear automatically once Shashura confirms delivery. Order: %s", $result['refund_transaction_id'], admin_url( 'post.php?post=' . $first . '&action=edit' ) )
 				);
 			}
 			return $result;
@@ -1448,6 +1451,15 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 			return new WP_REST_Response( array( 'ok' => false, 'error' => 'bad_json' ), 400 );
 		}
 
+		// A refund's customer payout can resolve asynchronously (MTN) well after
+		// the original refund request returned "needs reconciliation". This is a
+		// completely different lifecycle from a collection settling — handle it
+		// on its own path rather than threading it through settlement logic
+		// (environment/attempt matching, /enquiry, etc.) that doesn't apply to it.
+		if ( isset( $event['event'] ) && 'transaction.refunded' === $event['event'] ) {
+			return $this->handle_refund_confirmation( $event );
+		}
+
 		// Signed but not for us: acknowledge so Shashura stops retrying, change nothing.
 		if ( isset( $event['type'] ) && 'COLLECTION' !== $event['type'] ) {
 			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
@@ -1492,6 +1504,102 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 			set_transient( $seen_key, 1, 10 * MINUTE_IN_SECONDS );
 		}
 		return new WP_REST_Response( array( 'ok' => true, 'state' => $state ), 200 );
+	}
+
+	/**
+	 * A refund's customer payout was pending when the refund request returned
+	 * (MTN resolves asynchronously via its own callback; Airtel never reaches
+	 * here because it settles inline). This is Shashura confirming — later,
+	 * out of band — whether the money actually arrived.
+	 *
+	 * The webhook is keyed to `tid`: the ORIGINAL collection's reference, i.e.
+	 * `tix_transaction_id` — never this payout's own ref, which the plugin
+	 * never recorded anywhere a lookup could use.
+	 *
+	 * @param array $event Decoded `transaction.refunded` webhook body.
+	 * @return WP_REST_Response
+	 */
+	private function handle_refund_confirmation( array $event ) {
+		/** @var $camptix Camptix_Plugin */
+		global $camptix;
+
+		$tid = isset( $event['tid'] ) && is_string( $event['tid'] ) ? $event['tid'] : '';
+		if ( '' === $tid ) {
+			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
+		}
+
+		$ids = get_posts( array(
+			'post_type'        => 'tix_attendee',
+			'post_status'      => self::STATUSES,
+			'posts_per_page'   => 1,
+			'fields'           => 'ids',
+			// phpcs:ignore WordPressVIPMinimum.Performance.WPQueryParams.SuppressFilters_suppress_filters -- a webhook must resolve its order regardless of any front-end query filter.
+			'suppress_filters' => true,
+			// phpcs:ignore WordPress.DB.SlowDBQuery.slow_db_query_meta_query -- the gateway's tid is only stored as post meta; there is no other lookup path.
+			'meta_query'       => array( array( 'key' => 'tix_transaction_id', 'value' => $tid, 'compare' => '=', 'type' => 'CHAR' ) ),
+		) );
+		if ( ! $ids ) {
+			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
+		}
+		$first = $ids[0];
+
+		$hold = get_post_meta( $first, '_shashura_refund_hold', true );
+		if ( ! is_array( $hold ) || 'reconciliation_required' !== ( $hold['phase'] ?? '' ) ) {
+			// Already resolved (or never held) — e.g. a retried webhook delivery. Idempotent no-op.
+			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
+		}
+
+		$payout = isset( $event['payout'] ) && is_array( $event['payout'] ) ? $event['payout'] : array();
+		$status = isset( $payout['status'] ) ? (string) $payout['status'] : '';
+
+		if ( 'TS' !== $status ) {
+			// Still not delivered (e.g. a FAILED notification arriving after the
+			// initial PENDING). Keep the hold, but record what we now know instead
+			// of leaving the admin to guess from the original, now-stale message.
+			$hold['result']['refund_transaction_details'] = array( 'raw' => $event );
+			update_post_meta( $first, '_shashura_refund_hold', wp_slash( $hold ) );
+			$camptix->log(
+				'Refund payout confirmed NOT delivered (' . ( $payout['message'] ?? 'no reason given' ) . '). Reconciliation hold remains; the ledger reversal was not repeated.',
+				$first, $event, 'refund'
+			);
+			return new WP_REST_Response( array( 'ok' => true, 'state' => 'still_held' ), 200 );
+		}
+
+		// Delivered. Release the hold either way; what happens next depends on
+		// whether the original call was a whole-order or a per-ticket refund.
+		delete_post_meta( $first, '_shashura_refund_hold' );
+		$data = isset( $hold['result'] ) && is_array( $hold['result'] ) ? $hold['result'] : array();
+
+		if ( 'partial' === ( $hold['via'] ?? 'full' ) ) {
+			// CampTix's own per-ticket bookkeeping (which attendees, what share of
+			// the amount each) only exists transiently inside camptix.php's own
+			// refund_attendees_partially() call — this hold cannot reconstruct it
+			// safely days later. Confirming delivery and unblocking further action
+			// is what matters here; applying the per-ticket split is a deliberate
+			// manual step, same as the rest of this patch's conservative posture.
+			$camptix->log(
+				'Refund payout for a PARTIAL refund is now confirmed delivered. The reconciliation hold is cleared. CampTix\'s per-ticket refund status was not changed automatically — update the affected attendee(s) manually if it has not already settled.',
+				$first, $data, 'refund'
+			);
+			wp_mail(
+				get_option( 'admin_email' ),
+				'CampTix Mobile Money partial refund payout confirmed',
+				sprintf( "The customer payout for a partial refund is now confirmed delivered (reference: %s). The reconciliation hold has been cleared. Please confirm the affected attendee(s) are marked refunded in CampTix. Order: %s", $data['refund_transaction_id'] ?? '', admin_url( 'post.php?post=' . $first . '&action=edit' ) )
+			);
+			return new WP_REST_Response( array( 'ok' => true, 'state' => 'cleared_partial' ), 200 );
+		}
+
+		// Whole-order refund: replay the same call payment_refund() would have
+		// made had the payout already been confirmed at request time.
+		$token = (string) get_post_meta( $first, 'tix_payment_token', true );
+		if ( '' === $token ) {
+			return new WP_REST_Response( array( 'ok' => true, 'state' => 'cleared_no_token' ), 200 );
+		}
+		$data['status'] = CampTix_Plugin::PAYMENT_STATUS_REFUNDED;
+		$this->report( $token, CampTix_Plugin::PAYMENT_STATUS_REFUNDED, $data, false );
+		$camptix->log( 'Refund payout now confirmed delivered; order recorded as refunded.', $first, $data, 'refund' );
+
+		return new WP_REST_Response( array( 'ok' => true, 'state' => 'refunded' ), 200 );
 	}
 
 	/* ==================================================================
