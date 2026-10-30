@@ -173,7 +173,7 @@ An automated end-to-end suite (92 checks) has been run against WordPress with bo
 = Credits =
 
 * **Developed and maintained by:** Techdom Digital Solutions ([https://techdom.io](https://techdom.io))
-* **Contributors:** Cipherwave Software Limited ([https://cipherwavesolutions.com](https://cipherwavesolutions.com)), Moses Ssebuwufu (ssebuwufumoses on WordPress.org and GitHub)
+* **Contributors:** Cipherwave Software Limited ([https://cipherwavesolutions.com](https://cipherwavesolutions.com)), Moses Ssebuwufu ([ssebuwufumoses](https://profiles.wordpress.org/ssebuwufumoses/) on WordPress.org, [@ssebuwufumoses](https://github.com/ssebuwufumoses) on GitHub)
 * **Trademarks:** The MTN MoMo and Airtel Money logos in `assets/images` are trademarks of MTN and Airtel.
 
 = Developer Filters =
