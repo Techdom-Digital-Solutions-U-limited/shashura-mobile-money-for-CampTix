@@ -829,7 +829,7 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 			// reversal. 'via' records whether this came from the whole-order refund
 			// button or a per-ticket partial refund — the later webhook confirmation
 			// needs to know which CampTix bookkeeping call to replay.
-			$hold = array( 'phase' => 'request_started', 'at' => time(), 'amount' => $amount, 'via' => $via );
+			$hold = array( 'phase' => 'request_started', 'at' => time(), 'amount' => $amount, 'via' => $via, 'env' => $this->options['environment'] );
 			if ( ! update_post_meta( $first, '_shashura_refund_hold', $hold ) ) {
 				return $failed;
 			}
@@ -1531,9 +1531,6 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 	 * @return WP_REST_Response
 	 */
 	private function handle_refund_confirmation( array $event ) {
-		/** @var $camptix Camptix_Plugin */
-		global $camptix;
-
 		$tid = isset( $event['tid'] ) && is_string( $event['tid'] ) ? $event['tid'] : '';
 		if ( '' === $tid ) {
 			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
@@ -1554,9 +1551,78 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 		}
 		$first = $ids[0];
 
+		// Same lock as refunds and settlement, so a confirmation can't race a new refund
+		// request on this order. Busy: ask Shashura to deliver it again later.
+		$token = (string) get_post_meta( $first, 'tix_payment_token', true );
+		if ( '' === $token ) {
+			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
+		}
+		$lock = $this->lock( $token );
+		if ( ! $lock ) {
+			return new WP_REST_Response( array( 'ok' => false, 'error' => 'busy' ), 503 );
+		}
+		try {
+			return $this->apply_refund_confirmation( $event, $first, $token );
+		} finally {
+			$this->unlock( $lock );
+		}
+	}
+
+	/**
+	 * Why a refund confirmation can't belong to the refund this order is waiting on, or ''.
+	 * Only fields the event actually carries are compared: a missing field can't prove a
+	 * mismatch. Covers an older refund's event arriving (or being replayed) after a newer
+	 * refund was requested, and an event from the other environment.
+	 */
+	private function refund_event_mismatch( array $event, array $hold ) {
+		$env = isset( $hold['env'] ) ? (string) $hold['env'] : (string) $this->options['environment'];
+		if ( isset( $event['environment'] ) && is_string( $event['environment'] ) && strtolower( $event['environment'] ) !== $env ) {
+			return 'environment';
+		}
+
+		if ( isset( $event['timestamp'] ) && is_scalar( $event['timestamp'] ) && ! empty( $hold['at'] ) ) {
+			$at = is_numeric( $event['timestamp'] ) ? (int) $event['timestamp'] : strtotime( (string) $event['timestamp'] );
+			// A minute of slack for clock differences; an older refund's event is older than that.
+			if ( $at && $at < (int) $hold['at'] - MINUTE_IN_SECONDS ) {
+				return 'older than the refund request';
+			}
+		}
+
+		$held_ref  = isset( $hold['result']['refund_transaction_id'] ) ? (string) $hold['result']['refund_transaction_id'] : '';
+		$event_ref = '';
+		if ( isset( $event['refund_ref'] ) && is_scalar( $event['refund_ref'] ) ) {
+			$event_ref = (string) $event['refund_ref'];
+		}
+		if ( '' !== $held_ref && '' !== $event_ref && $held_ref !== $event_ref ) {
+			return 'refund reference';
+		}
+
+		$event_amount = isset( $event['amount_refunded'] ) && is_numeric( $event['amount_refunded'] ) ? (float) $event['amount_refunded'] : null;
+		$held_amount  = isset( $hold['result']['refund_transaction_details']['raw']['amount_refunded'] ) && is_numeric( $hold['result']['refund_transaction_details']['raw']['amount_refunded'] )
+			? (float) $hold['result']['refund_transaction_details']['raw']['amount_refunded']
+			: null;
+		if ( null !== $event_amount && null !== $held_amount && $held_amount > 0 && abs( $event_amount - $held_amount ) > 0.001 ) {
+			return 'amount';
+		}
+
+		return '';
+	}
+
+	/** The rest of handle_refund_confirmation(), run under the order lock. */
+	private function apply_refund_confirmation( array $event, $first, $token ) {
+		/** @var $camptix Camptix_Plugin */
+		global $camptix;
+
+		// Read the hold under the lock: a refund request may have just replaced it.
 		$hold = get_post_meta( $first, '_shashura_refund_hold', true );
 		if ( ! is_array( $hold ) || 'reconciliation_required' !== ( $hold['phase'] ?? '' ) ) {
 			// Already resolved (or never held) — e.g. a retried webhook delivery. Idempotent no-op.
+			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
+		}
+
+		$mismatch = $this->refund_event_mismatch( $event, $hold );
+		if ( '' !== $mismatch ) {
+			$camptix->log( 'Refund confirmation ignored: it does not match the refund this order is waiting on (' . $mismatch . '). The hold stays.', $first, $event, 'refund' );
 			return new WP_REST_Response( array( 'ok' => true, 'ignored' => true ), 200 );
 		}
 
@@ -1602,10 +1668,6 @@ class Shasmomo_Payment_Method extends CampTix_Payment_Method {
 
 		// Whole-order refund: replay the same call payment_refund() would have
 		// made had the payout already been confirmed at request time.
-		$token = (string) get_post_meta( $first, 'tix_payment_token', true );
-		if ( '' === $token ) {
-			return new WP_REST_Response( array( 'ok' => true, 'state' => 'cleared_no_token' ), 200 );
-		}
 		$data['status'] = CampTix_Plugin::PAYMENT_STATUS_REFUNDED;
 		$this->report( $token, CampTix_Plugin::PAYMENT_STATUS_REFUNDED, $data, false );
 		$camptix->log( 'Refund payout now confirmed delivered; order recorded as refunded.', $first, $data, 'refund' );
