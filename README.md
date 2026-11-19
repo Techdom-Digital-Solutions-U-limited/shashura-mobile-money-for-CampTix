@@ -40,14 +40,13 @@ The plugin connects CampTix to the Shashura Mobile Money API and handles the ful
 - A duplicate payment on the same order is detected and flagged to the site administrator for a manual refund, rather than accepted or dropped silently.
 - Incoming webhooks are verified against an HMAC-SHA256 signature. Unsigned, forged, oversized or mismatched-environment events are rejected.
 - A per-order lock stops the webhook, the buyer's browser, an order cancellation and CampTix's own timeout sweep from recording conflicting outcomes for the same order at the same time.
-- A payment approved after an order was cancelled or timed out is still recognised and completes the order.
-- Works with current CampTix (2.x), the version WordCamp.org runs. CampTix 1.4.x also works, with one known limitation: when a webhook settles an order, CampTix 1.x ends the request itself, so Shashura gets an empty reply instead of the plugin's response. The order is still updated.
+- Requires CampTix with non-interactive payment results (the four-argument API in current CampTix 2.x). CampTix 1.x is unsupported: it can terminate webhook requests before a response is sent. On an incompatible version, this payment method is not registered and administrators see an upgrade notice. Upgrade CampTix before accepting new Mobile Money payments.
 
 The public repository contains standalone regression tests with in-memory WordPress/CampTix doubles and mocked gateway responses. Run `php bin/test.php` or `composer test`; GitHub Actions runs the suite on PHP 7.4, 8.2 and 8.4. Coverage and remaining integration gaps are documented in [tests/README.md](https://github.com/Techdom-Digital-Solutions-U-limited/shashura-mobile-money-for-CampTix/blob/main/tests/README.md). The historical 92-check end-to-end suite and independent security-review report are not published here; the public regressions do not substantiate those claims.
 
 ## Requirements
 
-- CampTix, with the ticket currency set to UGX.
+- CampTix with the four-argument non-interactive payment-result API (current 2.x), with the ticket currency set to UGX. CampTix 1.x is not supported.
 - A Shashura merchant account with an app configured for Mobile Money collections, and its Client ID, Client Secret and Webhook Secret.
 - A publicly reachable site, with the server's outbound IP whitelisted on the Shashura app, so callbacks and settlement can reach the plugin.
 
